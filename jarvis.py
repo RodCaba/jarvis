@@ -438,7 +438,7 @@ class SpeechToText:
 class TextToSpeech:
     """Síntesis de voz usando Piper (local) o macOS nativo (fallback)."""
 
-    def __init__(self, config: Config, engine: str = "piper"):
+    def __init__(self, config: Config, engine: str = "macos"):
         self.config = config
         self.engine = engine
         self.voice = None
@@ -492,7 +492,7 @@ class TextToSpeech:
 
     def _speak_macos(self, text: str):
         """Habla usando la voz nativa de macOS (say command)."""
-        voice = "Mónica" if self.config.LANG == "es" else "Daniel"
+        voice = "Jorge" if self.config.LANG == "es" else "Daniel"
         try:
             subprocess.run(
                 ["say", "-v", voice, "-r", "180", text],
@@ -704,7 +704,7 @@ class Jarvis:
     🎤 STT (Whisper) → 🧠 LLM (Claude Code) → 🔊 TTS (Piper)
     """
 
-    def __init__(self, config: Config, tts_engine: str = "piper"):
+    def __init__(self, config: Config, tts_engine: str = "macos"):
         self.config = config
         self.running = False
 
