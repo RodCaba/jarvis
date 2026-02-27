@@ -100,7 +100,7 @@ class Config:
 
     # ── Claude Code ──
     CLAUDE_CMD = "claude"
-    CLAUDE_TIMEOUT = 120          # Timeout en segundos
+    CLAUDE_TIMEOUT = 2400          # Timeout en segundos
     CLAUDE_SYSTEM_PROMPT = (
         "Eres JARVIS, el asistente de inteligencia artificial personal del usuario. "
         "Respondes de forma concisa, clara y directa. Tus respuestas serán leídas en voz alta, "
@@ -458,10 +458,11 @@ class ClaudeCode:
         self.config = config
         self.session_id = None  # Se obtiene en la primera llamada
 
-    def ask(self, prompt: str) -> str:
+    def ask_raw(self, prompt: str, extra_args: list[str] | None = None) -> dict:
         """
-        Envía un prompt a Claude Code y retorna la respuesta.
+        Envía un prompt a Claude Code y retorna el JSON completo parseado.
         Usa --resume para mantener el contexto de la conversación entre turnos.
+        extra_args permite pasar argumentos adicionales (ej: --allowedTools).
         """
         try:
             cmd = [
@@ -475,6 +476,9 @@ class ClaudeCode:
             if self.session_id:
                 cmd.extend(["--resume", self.session_id])
 
+            if extra_args:
+                cmd.extend(extra_args)
+
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -486,24 +490,152 @@ class ClaudeCode:
             # Parsear respuesta JSON para extraer texto y session_id
             try:
                 data = json.loads(result.stdout)
-                response = data.get("result", "").strip()
                 self.session_id = data.get("session_id", self.session_id)
             except (json.JSONDecodeError, ValueError):
                 # Fallback: tratar stdout como texto plano
-                response = result.stdout.strip()
+                data = {"result": result.stdout.strip()}
 
-            if result.returncode != 0 and not response:
+            if result.returncode != 0 and not data.get("result", "").strip():
                 error = result.stderr.strip()
-                response = f"Hubo un error procesando tu solicitud: {error[:200]}"
+                data["result"] = f"Hubo un error procesando tu solicitud: {error[:200]}"
 
-            return response
+            return data
 
         except subprocess.TimeoutExpired:
-            return "La solicitud tomó demasiado tiempo. ¿Podrías reformular tu pregunta?"
+            return {"result": "La solicitud tomó demasiado tiempo. ¿Podrías reformular tu pregunta?"}
         except FileNotFoundError:
-            return "No pude encontrar Claude Code. Asegúrate de que esté instalado."
+            return {"result": "No pude encontrar Claude Code. Asegúrate de que esté instalado."}
         except Exception as e:
-            return f"Error inesperado: {str(e)[:200]}"
+            return {"result": f"Error inesperado: {str(e)[:200]}"}
+
+    def ask(self, prompt: str, extra_args: list[str] | None = None) -> str:
+        """
+        Envía un prompt a Claude Code y retorna solo el texto de respuesta.
+        Wrapper de conveniencia sobre ask_raw().
+        """
+        data = self.ask_raw(prompt, extra_args=extra_args)
+        return data.get("result", "").strip()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MÓDULO PERMISOS - Gestión dinámica de permisos por voz
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PermissionManager:
+    """Detecta denegaciones de permisos de Claude Code y gestiona su concesión por voz."""
+
+    GRANTABLE_TOOLS = [
+        "Read", "Edit", "Write", "Glob", "Grep",
+        "Bash(git:*)", "Bash(pip:*)", "Bash(npm:*)", "Bash(mkdir:*)",
+        "Bash(cp:*)", "Bash(mv:*)", "Bash(ls:*)", "Bash(which:*)",
+        "Bash(node:*)", "Bash(brew:*)", "Bash(python3:*)", "Bash(curl:*)",
+    ]
+
+    AFFIRMATIVE_RESPONSES = {
+        "es": [
+            "sí", "si", "claro", "dale", "ok", "hazlo", "adelante",
+            "por supuesto", "va", "bueno", "perfecto", "de acuerdo",
+            "seguro", "afirmativo",
+        ],
+        "en": [
+            "yes", "yeah", "sure", "ok", "go ahead", "do it",
+            "of course", "absolutely", "yep", "yup",
+        ],
+    }
+
+    NEGATIVE_RESPONSES = {
+        "es": ["no", "nop", "negativo", "cancelar", "cancela", "mejor no"],
+        "en": ["no", "nope", "negative", "cancel", "stop", "never mind"],
+    }
+
+    MESSAGES = {
+        "es": {
+            "ask": (
+                "Necesito permisos adicionales para completar esta tarea. "
+                "Se habilitarán permisos de lectura, escritura y edición de archivos, "
+                "y ejecución de comandos comunes. ¿Me los concedes?"
+            ),
+            "granted": "Permisos concedidos. Reintentando.",
+            "denied": "Entendido, no se otorgaron permisos.",
+            "error": "No pude entender tu respuesta. Por seguridad, no se otorgaron permisos.",
+        },
+        "en": {
+            "ask": (
+                "I need additional permissions to complete this task. "
+                "This will enable file read, write, and edit permissions, "
+                "and execution of common commands. Do you grant them?"
+            ),
+            "granted": "Permissions granted. Retrying.",
+            "denied": "Understood, permissions were not granted.",
+            "error": "I couldn't understand your response. For safety, permissions were not granted.",
+        },
+    }
+
+    def __init__(self, config: Config):
+        self.config = config
+
+    def has_permission_denials(self, data: dict) -> bool:
+        """Checa si la respuesta de Claude Code contiene denegaciones de permisos."""
+        denials = data.get("permission_denials")
+        return isinstance(denials, list) and len(denials) > 0
+
+    def get_denied_tools(self, data: dict) -> list[str]:
+        """Extrae nombres de herramientas denegadas de la respuesta."""
+        denials = data.get("permission_denials", [])
+        return [d.get("tool_name", "") for d in denials if d.get("tool_name")]
+
+    def is_affirmative(self, text: str) -> bool:
+        """Evalúa si la respuesta de voz es afirmativa."""
+        text_lower = text.lower().strip()
+        phrases = (
+            self.AFFIRMATIVE_RESPONSES.get(self.config.LANG, [])
+            + self.AFFIRMATIVE_RESPONSES.get("en", [])
+        )
+        return any(phrase in text_lower for phrase in phrases)
+
+    def is_negative(self, text: str) -> bool:
+        """Evalúa si la respuesta de voz es negativa."""
+        text_lower = text.lower().strip()
+        phrases = (
+            self.NEGATIVE_RESPONSES.get(self.config.LANG, [])
+            + self.NEGATIVE_RESPONSES.get("en", [])
+        )
+        return any(phrase in text_lower for phrase in phrases)
+
+    def update_settings_file(self):
+        """Persiste los permisos en .claude/settings.local.json."""
+        settings_path = Path.home() / ".claude" / "settings.local.json"
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+        settings = {}
+        if settings_path.exists():
+            try:
+                settings = json.loads(settings_path.read_text())
+            except (json.JSONDecodeError, ValueError):
+                settings = {}
+
+        existing = set(settings.get("permissions", {}).get("allow", []))
+        existing.update(self.GRANTABLE_TOOLS)
+        settings.setdefault("permissions", {})["allow"] = sorted(existing)
+
+        settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+        print_status("✅ Permisos guardados en ~/.claude/settings.local.json", Colors.GREEN)
+
+    @property
+    def ask_prompt(self) -> str:
+        return self.MESSAGES.get(self.config.LANG, self.MESSAGES["en"])["ask"]
+
+    @property
+    def granted_msg(self) -> str:
+        return self.MESSAGES.get(self.config.LANG, self.MESSAGES["en"])["granted"]
+
+    @property
+    def denied_msg(self) -> str:
+        return self.MESSAGES.get(self.config.LANG, self.MESSAGES["en"])["denied"]
+
+    @property
+    def error_msg(self) -> str:
+        return self.MESSAGES.get(self.config.LANG, self.MESSAGES["en"])["error"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -525,18 +657,24 @@ class Jarvis:
         self.stt = SpeechToText(config)
         self.tts = TextToSpeech(config, engine=tts_engine)
         self.claude = ClaudeCode(config)
+        self.permissions = PermissionManager(config)
 
         # Manejar Ctrl+C gracefully
         signal.signal(signal.SIGINT, self._handle_shutdown)
 
     def _handle_shutdown(self, signum, frame):
-        """Maneja shutdown graceful."""
-        print(f"\n\n{Colors.YELLOW}  ⚡ Señal de apagado recibida...{Colors.RESET}")
+        """Maneja shutdown graceful. Doble Ctrl+C fuerza salida inmediata."""
+        # Segundo Ctrl+C → forzar salida inmediata
+        signal.signal(signal.SIGINT, lambda s, f: os._exit(1))
+        print(f"\n\n{Colors.YELLOW}  ⚡ Señal de apagado recibida (Ctrl+C de nuevo para forzar)...{Colors.RESET}")
         self.running = False
-        farewell = self.config.FAREWELL.get(self.config.LANG, "Shutting down.")
-        self.tts.speak(farewell)
         self.stt.cleanup()
-        sys.exit(0)
+        try:
+            farewell = self.config.FAREWELL.get(self.config.LANG, "Shutting down.")
+            self.tts.speak(farewell)
+        except Exception:
+            pass
+        os._exit(0)
 
     def _is_exit_command(self, text: str) -> bool:
         """Verifica si el texto es un comando de salida."""
@@ -549,6 +687,60 @@ class Jarvis:
         if not self.config.WAKE_WORD:
             return True
         return self.config.WAKE_WORD.lower() in text.lower()
+
+    def _handle_permission_request(self, original_prompt: str, claude_data: dict) -> str | None:
+        """
+        Maneja una denegación de permisos: pregunta al usuario por voz,
+        y si acepta, persiste permisos y reintenta la operación.
+        Retorna la nueva respuesta o None si se denegaron.
+        """
+        denied = self.permissions.get_denied_tools(claude_data)
+        print_status(f"🔒 Permisos denegados para: {', '.join(denied)}", Colors.YELLOW)
+
+        # Preguntar al usuario por voz
+        self.tts.speak(self.permissions.ask_prompt)
+        print_jarvis(self.permissions.ask_prompt)
+
+        # Escuchar respuesta
+        user_response = self.stt.listen()
+
+        if not user_response:
+            # Sin respuesta → denegar por seguridad
+            self.tts.speak(self.permissions.error_msg)
+            print_status("⚠️  Sin respuesta, permisos no otorgados.", Colors.YELLOW)
+            return None
+
+        print_user(user_response)
+
+        # Checar si es comando de salida (ej: "apagar")
+        if self._is_exit_command(user_response):
+            self.running = False
+            self.tts.speak(self.permissions.denied_msg)
+            return None
+
+        # Checar negativa primero (seguridad: "no, por supuesto que no")
+        if self.permissions.is_negative(user_response):
+            self.tts.speak(self.permissions.denied_msg)
+            print_status("🚫 Permisos denegados por el usuario.", Colors.YELLOW)
+            return None
+
+        if self.permissions.is_affirmative(user_response):
+            self.tts.speak(self.permissions.granted_msg)
+            print_status("✅ Permisos concedidos por el usuario.", Colors.GREEN)
+
+            # Persistir permisos en settings.local.json
+            self.permissions.update_settings_file()
+
+            # Reintentar con --allowedTools para efecto inmediato
+            allowed_args = ["--allowedTools"] + self.permissions.GRANTABLE_TOOLS
+            print_status("⏳ Reintentando con permisos...", Colors.BLUE)
+            retry_data = self.claude.ask_raw(original_prompt, extra_args=allowed_args)
+            return retry_data.get("result", "").strip()
+
+        # Respuesta ambigua → denegar por seguridad
+        self.tts.speak(self.permissions.error_msg)
+        print_status("⚠️  Respuesta ambigua, permisos no otorgados.", Colors.YELLOW)
+        return None
 
     def run(self):
         """Loop principal de JARVIS."""
@@ -597,7 +789,18 @@ class Jarvis:
                 print_status(f"⏳ {processing_msg}")
 
                 # 6. Enviar a Claude Code
-                response = self.claude.ask(user_text)
+                claude_data = self.claude.ask_raw(user_text)
+                response = claude_data.get("result", "").strip()
+
+                # 6.1 Manejar denegaciones de permisos
+                if self.permissions.has_permission_denials(claude_data):
+                    retry_response = self._handle_permission_request(user_text, claude_data)
+                    if retry_response is not None:
+                        response = retry_response
+
+                # 6.2 Si el usuario pidió apagar durante el flujo de permisos
+                if not self.running:
+                    break
 
                 # 7. Mostrar respuesta completa en terminal
                 print_jarvis(response)
