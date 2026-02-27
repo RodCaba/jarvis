@@ -99,12 +99,48 @@ pip install -q \
     numpy \
     pyaudio \
     faster-whisper \
-    elevenlabs
+    piper-tts \
+    sounddevice
 
 echo -e "${GREEN}  ✅ Paquetes Python instalados${RESET}"
 
-# ── 6. Verificar Claude Code ──
-echo -e "${CYAN}[5/6]${RESET} Verificando Claude Code CLI..."
+# ── 6. Descargar modelos Piper TTS ──
+echo -e "${CYAN}[5/7]${RESET} Descargando modelos de voz Piper..."
+
+MODELS_DIR="${SCRIPT_DIR}/models"
+mkdir -p "$MODELS_DIR"
+
+PIPER_BASE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/v1.0"
+
+declare -A PIPER_MODELS
+PIPER_MODELS=(
+    ["es_ES-davefx-medium"]="es/es_ES/davefx/medium"
+    ["en_US-lessac-medium"]="en/en_US/lessac/medium"
+)
+
+for model_name in "${!PIPER_MODELS[@]}"; do
+    model_subpath="${PIPER_MODELS[$model_name]}"
+    onnx_file="$MODELS_DIR/${model_name}.onnx"
+    json_file="$MODELS_DIR/${model_name}.onnx.json"
+
+    if [ -f "$onnx_file" ] && [ -f "$json_file" ]; then
+        echo -e "${GREEN}  ✅ ${model_name}${RESET}"
+    else
+        echo -e "${YELLOW}  → Descargando ${model_name} (~60MB)...${RESET}"
+        curl -L -# -o "$onnx_file" "${PIPER_BASE_URL}/${model_subpath}/${model_name}.onnx"
+        curl -sL -o "$json_file" "${PIPER_BASE_URL}/${model_subpath}/${model_name}.onnx.json"
+
+        if [ -f "$onnx_file" ] && [ -s "$onnx_file" ]; then
+            echo -e "${GREEN}  ✅ ${model_name}${RESET}"
+        else
+            echo -e "${RED}  ❌ Error descargando ${model_name}${RESET}"
+            rm -f "$onnx_file" "$json_file"
+        fi
+    fi
+done
+
+# ── 7. Verificar Claude Code ──
+echo -e "${CYAN}[6/7]${RESET} Verificando Claude Code CLI..."
 if command -v claude &> /dev/null; then
     echo -e "${GREEN}  ✅ Claude Code CLI instalado${RESET}"
 else
@@ -113,8 +149,8 @@ else
     echo -e "${DIM}  → Luego autentícate con: claude auth${RESET}"
 fi
 
-# ── 7. Configurar ElevenLabs API Key ──
-echo -e "${CYAN}[6/6]${RESET} Configurando ElevenLabs..."
+# ── 8. Configurar ElevenLabs API Key ──
+echo -e "${CYAN}[7/7]${RESET} Configurando ElevenLabs..."
 
 if [ -n "$ELEVEN_API_KEY" ]; then
     echo -e "${GREEN}  ✅ ELEVEN_API_KEY configurada${RESET}"

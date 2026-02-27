@@ -1,2 +1,11 @@
 # Claude settings
-.claude_settings/*
+.claude_settings/
+.claude/
+
+# .venv
+.venv/
+
+# Piper ONNX models (downloaded at install time)
+models/*.onnx
+models/*.onnx.json
+/models

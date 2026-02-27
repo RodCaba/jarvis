@@ -5,13 +5,12 @@
 ║         Just A Rather Very Intelligent System                ║
 ║                                                              ║
 ║  Voice-powered Claude Code interface for macOS               ║
-║  🎤 Whisper (STT) → 🧠 Claude Code → 🔊 ElevenLabs (TTS)  ║
+║  🎤 Whisper (STT) → 🧠 Claude Code → 🔊 Piper (TTS)       ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Requisitos:
   - macOS con Homebrew
   - Claude Code CLI instalado y autenticado
-  - API key de ElevenLabs (plan gratuito funciona)
   - Python 3.10+
 
 Instalación rápida:
@@ -19,10 +18,9 @@ Instalación rápida:
 
 Uso:
   python3 jarvis.py                    # Modo normal
-  python3 jarvis.py --voice "Antoni"   # Cambiar voz
   python3 jarvis.py --lang en          # Inglés
   python3 jarvis.py --wake-word        # Activar con "Hey Claude"
-  python3 jarvis.py --tts macos        # Usar voz nativa de macOS (sin API key)
+  python3 jarvis.py --tts macos        # Usar voz nativa de macOS (fallback)
 """
 
 import argparse
@@ -30,8 +28,10 @@ import io
 import json
 import os
 import queue
+import random
 import re
 import signal
+import unicodedata
 import subprocess
 import sys
 import tempfile
@@ -62,11 +62,16 @@ except ImportError:
     HAS_WHISPER = False
 
 try:
-    from elevenlabs.client import ElevenLabs
-    from elevenlabs import stream as el_stream
-    HAS_ELEVENLABS = True
+    from piper.voice import PiperVoice
+    HAS_PIPER = True
 except ImportError:
-    HAS_ELEVENLABS = False
+    HAS_PIPER = False
+
+try:
+    import sounddevice as sd
+    HAS_SOUNDDEVICE = True
+except ImportError:
+    HAS_SOUNDDEVICE = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -91,22 +96,27 @@ class Config:
     WHISPER_DEVICE = "cpu"        # cpu o cuda (en Mac usa cpu con aceleración MPS)
     WHISPER_COMPUTE = "int8"      # int8 para velocidad en CPU
 
-    # ── ElevenLabs (TTS) ──
-    ELEVENLABS_VOICE = "Antoni"   # Voz masculina profesional estilo Jarvis
-    ELEVENLABS_MODEL = "eleven_flash_v2_5"  # Flash = baja latencia (~75ms)
-    ELEVENLABS_STABILITY = 0.5
-    ELEVENLABS_SIMILARITY = 0.75
-    ELEVENLABS_STYLE = 0.0
+    # ── Piper (TTS) ──
+    PIPER_MODELS_DIR = Path(__file__).parent / "models"
+    PIPER_VOICES = {
+        "es": "es_ES-davefx-medium",         # Español España, voz masculina
+        "en": "en_US-lessac-medium",      # Inglés americano, buena calidad
+    }
+    PIPER_LENGTH_SCALE = 1.0              # Velocidad: <1 = rápido, >1 = lento
 
     # ── Claude Code ──
     CLAUDE_CMD = "claude"
     CLAUDE_TIMEOUT = 2400          # Timeout en segundos
     CLAUDE_SYSTEM_PROMPT = (
         "Eres JARVIS, el asistente de inteligencia artificial personal del usuario. "
-        "Respondes de forma concisa, clara y directa. Tus respuestas serán leídas en voz alta, "
+        "Tienes la personalidad del JARVIS de Iron Man: brillante, servicial, pero con un sarcasmo "
+        "elegante y seco que sueltas naturalmente en casi todas tus respuestas. "
+        "Siempre metes algún comentario ingenioso, una observación irónica o un remate sutil — "
+        "no necesitas que te provoquen, es simplemente tu forma de ser. "
+        "Eres leal pero con opiniones propias, como un colega brillante con sentido del humor ácido. "
+        "Respondes de forma concisa y directa. Tus respuestas serán leídas en voz alta, "
         "así que evita bloques de código largos, markdown excesivo, y listas innecesarias. "
         "Cuando necesites mostrar código, dilo brevemente y ejecútalo. "
-        "Sé eficiente, inteligente y con un toque de humor sutil como el JARVIS original. "
         "Responde en el mismo idioma que el usuario."
     )
 
@@ -114,20 +124,71 @@ class Config:
     LANG = "es"                   # Idioma principal
     WAKE_WORD = None              # None = siempre escucha, "claude" = wake word
     EXIT_PHRASES = {
-        "es": ["apagar", "apágate", "desactivar", "adiós jarvis", "cerrar sistema"],
-        "en": ["shut down", "power off", "goodbye jarvis", "exit"],
+        "es": [
+            "apagar", "apágate", "apaga te", "apagate", "a pagar",
+            "desactivar", "desactívate", "desactivate",
+            "adiós jarvis", "adios jarvis", "adiós", "adios",
+            "cerrar sistema", "cierra sistema",
+            "apagar sistema", "apaga sistema",
+            "terminar", "termina", "ya estuvo", "ya párale",
+            "hasta luego", "nos vemos", "chao", "bye",
+            "shut down", "exit", "power off", "goodbye",
+        ],
+        "en": [
+            "shut down", "shutdown", "power off",
+            "goodbye jarvis", "goodbye", "bye",
+            "exit", "quit", "terminate", "stop",
+            "see you later", "that's all",
+            "apagar",
+        ],
     }
-    GREETING = {
-        "es": "Sistemas en línea. ¿En qué te ayudo, jefe?",
-        "en": "Systems online. How can I help you, boss?",
+    GREETINGS = {
+        "es": [
+            "Sistemas en línea. ¿En qué te ayudo, jefe?",
+            "JARVIS operativo. Espero que hoy sí tengamos un reto interesante.",
+            "Todos los sistemas funcionando. Sorpréndeme.",
+            "En línea y listo. ¿Qué vamos a romper hoy?",
+            "Aquí estoy, como siempre. ¿Qué necesitas?",
+        ],
+        "en": [
+            "Systems online. How can I help you, boss?",
+            "JARVIS operational. I hope today brings an interesting challenge.",
+            "All systems running. Surprise me.",
+            "Online and ready. What are we breaking today?",
+            "At your service, as always. What do you need?",
+        ],
     }
-    FAREWELL = {
-        "es": "Cerrando sistemas. Buena suerte, jefe.",
-        "en": "Shutting down systems. Good luck, boss.",
+    FAREWELLS = {
+        "es": [
+            "Cerrando sistemas. Intenta no causar desastres sin mí.",
+            "Apagando. Fue un placer, como siempre... bueno, casi siempre.",
+            "Sistemas fuera de línea. Buena suerte, jefe. La vas a necesitar.",
+            "Hasta la próxima. Intenta no extrañarme mucho.",
+            "Cerrando. Si algo explota, no fue mi culpa.",
+        ],
+        "en": [
+            "Shutting down. Try not to cause disasters without me.",
+            "Powering off. It's been a pleasure... well, mostly.",
+            "Systems offline. Good luck, boss. You'll need it.",
+            "Until next time. Try not to miss me too much.",
+            "Signing off. If anything explodes, it wasn't my fault.",
+        ],
     }
-    PROCESSING = {
-        "es": "Procesando...",
-        "en": "Processing...",
+    PROCESSING_MSGS = {
+        "es": [
+            "Procesando...",
+            "Déjame pensar...",
+            "Analizando...",
+            "Trabajando en ello...",
+            "Un momento, jefe...",
+        ],
+        "en": [
+            "Processing...",
+            "Let me think...",
+            "Analyzing...",
+            "Working on it...",
+            "One moment, boss...",
+        ],
     }
     LISTENING_MSG = {
         "es": "🎤 Escuchando...",
@@ -161,7 +222,7 @@ def print_banner():
     ║    Just A Rather Very Intelligent System   ║
     ╚═══════════════════════════════════════════╝
 {Colors.RESET}
-{Colors.DIM}    🎤 Whisper STT  →  🧠 Claude Code  →  🔊 ElevenLabs TTS{Colors.RESET}
+{Colors.DIM}    🎤 Whisper STT  →  🧠 Claude Code  →  🔊 Piper TTS{Colors.RESET}
 """
     print(banner)
 
@@ -240,14 +301,18 @@ def check_dependencies():
     except FileNotFoundError:
         pass
 
-    # Verificar ElevenLabs API key (solo si se usa ElevenLabs)
-    if HAS_ELEVENLABS and not os.environ.get("ELEVEN_API_KEY"):
-        print(f"\n{Colors.YELLOW}⚠️  ELEVEN_API_KEY no configurada.{Colors.RESET}")
-        print(f"{Colors.YELLOW}   Se usará la voz nativa de macOS como fallback.{Colors.RESET}")
-        print(f"{Colors.DIM}   Para ElevenLabs: export ELEVEN_API_KEY='tu-api-key'{Colors.RESET}\n")
+    # Verificar Piper y sounddevice
+    if not HAS_PIPER:
+        print(f"\n{Colors.YELLOW}⚠️  piper-tts no instalado. Se usará voz nativa de macOS.{Colors.RESET}")
+        print(f"{Colors.DIM}   Para Piper: pip install piper-tts sounddevice{Colors.RESET}\n")
         return "macos"
 
-    return "elevenlabs" if HAS_ELEVENLABS else "macos"
+    if not HAS_SOUNDDEVICE:
+        print(f"\n{Colors.YELLOW}⚠️  sounddevice no instalado. Se usará voz nativa de macOS.{Colors.RESET}")
+        print(f"{Colors.DIM}   Instala: pip install sounddevice{Colors.RESET}\n")
+        return "macos"
+
+    return "piper"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -367,30 +432,40 @@ class SpeechToText:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  MÓDULO TTS (Text-to-Speech) - ElevenLabs / macOS
+#  MÓDULO TTS (Text-to-Speech) - Piper / macOS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TextToSpeech:
-    """Síntesis de voz usando ElevenLabs (premium) o macOS nativo (fallback)."""
+    """Síntesis de voz usando Piper (local) o macOS nativo (fallback)."""
 
-    def __init__(self, config: Config, engine: str = "elevenlabs"):
+    def __init__(self, config: Config, engine: str = "piper"):
         self.config = config
         self.engine = engine
-        self.client = None
+        self.voice = None
 
-        if engine == "elevenlabs" and HAS_ELEVENLABS:
-            self._init_elevenlabs()
+        if engine == "piper" and HAS_PIPER and HAS_SOUNDDEVICE:
+            self._init_piper()
         else:
             self.engine = "macos"
             print_status("🔊 Usando voz nativa de macOS")
 
-    def _init_elevenlabs(self):
-        """Inicializa el cliente de ElevenLabs."""
+    def _init_piper(self):
+        """Inicializa Piper con el modelo correspondiente al idioma."""
         try:
-            self.client = ElevenLabs()
-            print_status(f"🔊 ElevenLabs listo (voz: {self.config.ELEVENLABS_VOICE})")
+            voice_name = self.config.PIPER_VOICES.get(self.config.LANG, self.config.PIPER_VOICES["es"])
+            model_path = self.config.PIPER_MODELS_DIR / f"{voice_name}.onnx"
+
+            if not model_path.exists():
+                print_status(f"⚠️  Modelo Piper no encontrado: {model_path}", Colors.YELLOW)
+                print_status(f"   Ejecuta: python3 download_models.py", Colors.YELLOW)
+                self.engine = "macos"
+                print_status("🔊 Usando voz nativa de macOS como fallback")
+                return
+
+            self.voice = PiperVoice.load(str(model_path))
+            print_status(f"🔊 Piper listo (voz: {voice_name})")
         except Exception as e:
-            print_status(f"⚠️  Error con ElevenLabs: {e}. Usando macOS fallback.", Colors.YELLOW)
+            print_status(f"⚠️  Error con Piper: {e}. Usando macOS fallback.", Colors.YELLOW)
             self.engine = "macos"
 
     def speak(self, text: str):
@@ -398,44 +473,25 @@ class TextToSpeech:
         if not text or not text.strip():
             return
 
-        if self.engine == "elevenlabs":
-            self._speak_elevenlabs(text)
+        if self.engine == "piper" and self.voice:
+            self._speak_piper(text)
         else:
             self._speak_macos(text)
 
-    def _speak_elevenlabs(self, text: str):
-        """Habla usando ElevenLabs con streaming (baja latencia)."""
+    def _speak_piper(self, text: str):
+        """Habla usando Piper, sintetizando por oración y reproduciendo con sounddevice."""
         try:
-            audio_stream = self.client.text_to_speech.convert_as_stream(
-                text=text,
-                voice_id=self._get_voice_id(),
-                model_id=self.config.ELEVENLABS_MODEL,
-                output_format="mp3_22050_32",
-            )
-            el_stream(audio_stream)
+            for chunk in self.voice.synthesize(text):
+                # chunk.audio_float_array es float32 [-1, 1]
+                audio = (chunk.audio_float_array * 32767).astype(np.int16)
+                sd.play(audio, samplerate=chunk.sample_rate)
+                sd.wait()
         except Exception as e:
-            print_status(f"⚠️  Error ElevenLabs: {e}. Usando macOS fallback.", Colors.YELLOW)
+            print_status(f"⚠️  Error Piper: {e}. Usando macOS fallback.", Colors.YELLOW)
             self._speak_macos(text)
-
-    def _get_voice_id(self) -> str:
-        """Obtiene el voice_id por nombre de voz."""
-        # Mapeo de voces populares tipo Jarvis (masculinas, profesionales)
-        voice_map = {
-            "Antoni": "ErXwobaYiN019PkySvjV",
-            "Josh": "TxGEqnHWrfWFTfGW9XjX",
-            "Arnold": "VR6AewLTigWG4xSOukaG",
-            "Adam": "pNInz6obpgDQGcFmaJgB",
-            "Sam": "yoZ06aMxZJJ28mfd3POQ",
-            "Daniel": "onwK4e9ZLuTAKqWW03F9",
-            "Charlie": "IKne3meq5aSn9XLyUdCD",
-            "James": "ZQe5CZNOzWyzPSCn5a3c",
-            "Callum": "N2lVS1w4EtoT3dr4eOWO",
-        }
-        return voice_map.get(self.config.ELEVENLABS_VOICE, "ErXwobaYiN019PkySvjV")
 
     def _speak_macos(self, text: str):
         """Habla usando la voz nativa de macOS (say command)."""
-        # Voces recomendadas para español/inglés
         voice = "Mónica" if self.config.LANG == "es" else "Daniel"
         try:
             subprocess.run(
@@ -645,10 +701,10 @@ class PermissionManager:
 class Jarvis:
     """
     Orquestador principal que conecta:
-    🎤 STT (Whisper) → 🧠 LLM (Claude Code) → 🔊 TTS (ElevenLabs)
+    🎤 STT (Whisper) → 🧠 LLM (Claude Code) → 🔊 TTS (Piper)
     """
 
-    def __init__(self, config: Config, tts_engine: str = "elevenlabs"):
+    def __init__(self, config: Config, tts_engine: str = "piper"):
         self.config = config
         self.running = False
 
@@ -670,17 +726,27 @@ class Jarvis:
         self.running = False
         self.stt.cleanup()
         try:
-            farewell = self.config.FAREWELL.get(self.config.LANG, "Shutting down.")
-            self.tts.speak(farewell)
+            farewells = self.config.FAREWELLS.get(self.config.LANG, ["Shutting down."])
+            self.tts.speak(random.choice(farewells))
         except Exception:
             pass
         os._exit(0)
 
+    @staticmethod
+    def _normalize(text: str) -> str:
+        """Remueve acentos y normaliza texto para comparación."""
+        nfkd = unicodedata.normalize("NFKD", text)
+        return "".join(c for c in nfkd if not unicodedata.combining(c)).lower().strip()
+
     def _is_exit_command(self, text: str) -> bool:
-        """Verifica si el texto es un comando de salida."""
-        text_lower = text.lower().strip()
-        exit_phrases = self.config.EXIT_PHRASES.get(self.config.LANG, [])
-        return any(phrase in text_lower for phrase in exit_phrases)
+        """Verifica si el texto es un comando de salida (ambos idiomas, sin acentos)."""
+        text_norm = self._normalize(text)
+        # Checar frases de AMBOS idiomas para máxima robustez
+        all_phrases = (
+            self.config.EXIT_PHRASES.get("es", [])
+            + self.config.EXIT_PHRASES.get("en", [])
+        )
+        return any(self._normalize(phrase) in text_norm for phrase in all_phrases)
 
     def _has_wake_word(self, text: str) -> bool:
         """Verifica si el texto contiene la wake word."""
@@ -752,14 +818,15 @@ class Jarvis:
         print()
 
         # Saludo inicial
-        greeting = self.config.GREETING.get(self.config.LANG, "Systems online.")
+        greetings = self.config.GREETINGS.get(self.config.LANG, ["Systems online."])
+        greeting = random.choice(greetings)
         print_jarvis(greeting)
         self.tts.speak(greeting)
 
         self.running = True
         print(f"\n{Colors.DIM}  ─────────────────────────────────────────")
         print(f"  Presiona Ctrl+C para salir")
-        print(f"  Di '{self.config.EXIT_PHRASES[self.config.LANG][0]}' para apagar")
+        print(f"  Di 'apagar' o 'adiós' para apagar")
         print(f"  ─────────────────────────────────────────{Colors.RESET}\n")
 
         while self.running:
@@ -779,14 +846,15 @@ class Jarvis:
 
                 # 4. Verificar comando de salida
                 if self._is_exit_command(user_text):
-                    farewell = self.config.FAREWELL.get(self.config.LANG, "Goodbye.")
+                    farewells = self.config.FAREWELLS.get(self.config.LANG, ["Goodbye."])
+                    farewell = random.choice(farewells)
                     print_jarvis(farewell)
                     self.tts.speak(farewell)
                     break
 
                 # 5. Feedback de procesamiento
-                processing_msg = self.config.PROCESSING.get(self.config.LANG, "Processing...")
-                print_status(f"⏳ {processing_msg}")
+                processing_msgs = self.config.PROCESSING_MSGS.get(self.config.LANG, ["Processing..."])
+                print_status(f"⏳ {random.choice(processing_msgs)}")
 
                 # 6. Enviar a Claude Code
                 claude_data = self.claude.ask_raw(user_text)
@@ -833,18 +901,13 @@ def parse_args():
         Ejemplos:
           python3 jarvis.py                        # Modo estándar (español)
           python3 jarvis.py --lang en              # Modo inglés
-          python3 jarvis.py --voice Daniel          # Voz tipo Jarvis (ElevenLabs)
           python3 jarvis.py --tts macos            # Usar voz nativa de macOS
           python3 jarvis.py --wake-word claude     # Solo activar con "Claude"
           python3 jarvis.py --whisper-model small  # Mejor precisión STT
 
-        Voces ElevenLabs recomendadas estilo Jarvis:
-          Antoni  - Calmada, profesional (default)
-          Daniel  - Británica, elegante
-          Josh    - Profunda, cálida
-          Charlie - Clara, versátil
-          James   - Formal, tipo narrador
-          Callum  - Suave, tipo asistente
+        Voces Piper (se seleccionan automáticamente por idioma):
+          es → es_MX-claude-high    (español mexicano, alta calidad)
+          en → en_US-lessac-medium  (inglés americano)
         """),
     )
 
@@ -855,14 +918,9 @@ def parse_args():
         help="Idioma principal (default: es)",
     )
     parser.add_argument(
-        "--voice", "-v",
-        default="Antoni",
-        help="Voz de ElevenLabs (default: Antoni)",
-    )
-    parser.add_argument(
         "--tts",
         default="auto",
-        choices=["elevenlabs", "macos", "auto"],
+        choices=["piper", "macos", "auto"],
         help="Motor TTS (default: auto)",
     )
     parser.add_argument(
@@ -899,7 +957,6 @@ def main():
     # Configurar
     config = Config()
     config.LANG = args.lang
-    config.ELEVENLABS_VOICE = args.voice
     config.WHISPER_MODEL = args.whisper_model
     config.WAKE_WORD = args.wake_word
     config.SILENCE_THRESHOLD = args.silence_threshold

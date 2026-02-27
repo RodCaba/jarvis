@@ -111,13 +111,47 @@ pip install -q \
     numpy \
     pyaudio \
     faster-whisper \
-    elevenlabs 2>/dev/null
+    piper-tts \
+    sounddevice 2>/dev/null
 
 echo -e "${GREEN}  ✅ Paquetes Python instalados${RESET}"
 deactivate
 
+# ── 6. Descargar modelos Piper TTS ──
+echo -e "${CYAN}[6/8]${RESET} Descargando modelos de voz Piper..."
+
+MODELS_DIR="$INSTALL_DIR/models"
+mkdir -p "$MODELS_DIR"
+
+PIPER_BASE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main"
+
+PIPER_NAMES="es_ES-davefx-medium en_US-lessac-medium"
+PIPER_PATHS="es/es_ES/davefx/medium en/en_US/lessac/medium"
+
+set -- $PIPER_PATHS
+for model_name in $PIPER_NAMES; do
+    model_subpath="$1"; shift
+    onnx_file="$MODELS_DIR/${model_name}.onnx"
+    json_file="$MODELS_DIR/${model_name}.onnx.json"
+
+    if [ -f "$onnx_file" ] && [ -f "$json_file" ]; then
+        echo -e "${GREEN}  ✅ ${model_name}${RESET}"
+    else
+        echo -e "${YELLOW}  → Descargando ${model_name} (~60MB)...${RESET}"
+        curl -L -# -o "$onnx_file" "${PIPER_BASE_URL}/${model_subpath}/${model_name}.onnx"
+        curl -sL -o "$json_file" "${PIPER_BASE_URL}/${model_subpath}/${model_name}.onnx.json"
+
+        if [ -f "$onnx_file" ] && [ -s "$onnx_file" ]; then
+            echo -e "${GREEN}  ✅ ${model_name}${RESET}"
+        else
+            echo -e "${RED}  ❌ Error descargando ${model_name}${RESET}"
+            rm -f "$onnx_file" "$json_file"
+        fi
+    fi
+done
+
 # ── 7. Crear comando global ──
-echo -e "${CYAN}[6/7]${RESET} Creando comando global 'jarvis'..."
+echo -e "${CYAN}[7/8]${RESET} Creando comando global 'jarvis'..."
 
 # Crear el launcher script
 LAUNCHER="$INSTALL_DIR/jarvis-launcher.sh"
@@ -164,7 +198,7 @@ else
 fi
 
 # ── 8. Verificar Claude Code ──
-echo -e "${CYAN}[7/7]${RESET} Verificando Claude Code CLI..."
+echo -e "${CYAN}[8/8]${RESET} Verificando Claude Code CLI..."
 if command -v claude &> /dev/null; then
     echo -e "${GREEN}  ✅ Claude Code CLI listo${RESET}"
 else
